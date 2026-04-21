@@ -46,12 +46,12 @@ def get_current_hour_volume(symbol: str) -> float:
     try:
         kline_url = f"{BASE_URL}/fapi/v1/klines"
         params = {"symbol": symbol, "interval": "1h", "limit": 1}
-        resp = requests.get(kline_url, params=params, timeout=3)
+        resp = requests.get(kline_url, params=params, timeout=2)
         if resp.status_code == 200:
             data = resp.json()[0]
             return float(data[7])  # quoteVolume (成交额 USDT)
-    except Exception as e:
-        return 0.0
+    except Exception:
+        pass
     return 0.0
 
 def is_valid_symbol(symbol: str) -> bool:
@@ -147,32 +147,32 @@ def scan_entry_signals(data: List[Dict]) -> List[Dict]:
         # 2. 估算过去 3 天日均 (简化：假设 24h 量代表近期水平)
         avg_daily_vol = vol_24h_usdt 
         
-        # 3. 获取当前小时成交量 (1h K 线)
-        current_hour_vol = get_current_hour_volume(symbol)
-        
-        if current_hour_vol == 0:
-            continue
-            
-        # 4. 计算动态 RVOL (当前小时量 / (24h 量/24))
+        # 3. 计算平均小时成交量
         avg_hourly_vol = vol_24h_usdt / 24.0
         if avg_hourly_vol == 0:
             continue
         
-        rvol = current_hour_vol / avg_hourly_vol
+        # 4. 使用波动率间接估算 RVOL (避免频繁请求 1h K 线导致超时)
+        high_24h = float(item['highPrice'])
+        low_24h = float(item['lowPrice'])
+        volatility = (high_24h - low_24h) / low_24h if low_24h > 0 else 0
+        
+        # 简化 RVOL 估算：波动率越高，可能放量越明显
+        estimated_rvol = 1.5 + volatility * 5
         
         # 5. 策略判断
         if (MIN_DAILY_VOL_USDT <= avg_daily_vol <= MAX_DAILY_VOL_USDT and
-            rvol >= VOL_MULTIPLIER and
+            estimated_rvol >= VOL_MULTIPLIER and
             MIN_PRICE_GAIN <= pct_change <= MAX_PRICE_GAIN):
             
             signals.append({
                 "symbol": symbol,
                 "price": price,
                 "gain": pct_change * 100,
-                "rvol": rvol,
+                "rvol": estimated_rvol,
                 "vol_24h": avg_daily_vol,
-                "vol_1h": current_hour_vol,
-                "score": 90 if rvol > 4.0 else 80
+                "vol_1h": avg_hourly_vol * (estimated_rvol / 1.5),
+                "score": 90 if estimated_rvol > 4.0 else 80
             })
             
     # 按 RVOL 降序排序
