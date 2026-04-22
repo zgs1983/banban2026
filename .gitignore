@@ -1,44 +1,47 @@
-```python
-# Compiled Python files
+# Compiled and build artifacts
 *.pyc
 __pycache__/
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.class
+*.out
 
-# Virtual environments
-venv/
+# Dependencies
 .venv/
+venv/
 .env
 .env.local
 *.env.*
 
-# Logs
+# Logs and temp files
 *.log
-
-# Temporary files
 *.tmp
 *.swp
+*.swo
 
-# Coverage reports
+# Editors
+.vscode/
+.idea/
+
+# Distribution and build
+dist/
+build/
+target/
+
+# Coverage
 .coverage
 coverage/
 htmlcov/
 
-# IDE specific
-.vscode/
-.idea/
-
-# Build artifacts
-dist/
-build/
-*.out
-*.exe
-*.dll
+# Python specific
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
 *.so
-*.a
-
-# Package management
-node_modules/
-.mypy_cache/
 .pytest_cache/
-target/
-.gradle/
-```
+.mypy_cache/
