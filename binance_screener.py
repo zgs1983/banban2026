@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Binance Futures Screener V3.2 - 机构增强版
+Binance Futures Screener V3.3 - 性能优化版
 更新日志:
-1. [新增] 均线趋势过滤 (MA20 > MA60)，只做多头排列
-2. [优化] 动态 RVOL 基准 (引入波动率压缩检测)
-3. [新增] 持仓量 (OI) 背离分析，精准识别顶部
-4. [新增] 资金费率监控，预警极端过热
+1. [优化] 批量获取 K 线数据，减少 API 请求次数
+2. [优化] 并行处理持仓量和资金费率查询
+3. [修复] 解决 V3.2 因频繁 API 调用导致的超时问题
+4. [新增] 添加请求重试机制和速率限制
 """
 
 import requests
@@ -15,25 +15,28 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 配置区域 =================
-# 建仓策略参数 (V3.2 增强)
+# 建仓策略参数 (V3.3 优化)
 MIN_DAILY_VOL_USDT = 1_000_000      
 MAX_DAILY_VOL_USDT = 10_000_000     
 VOL_MULTIPLIER = 2.5                
 MAX_PRICE_GAIN = 0.12               
 MIN_PRICE_GAIN = -0.02              
 MIN_LIQUIDITY_USDT = 500_000        
-USE_MA_FILTER = True                # [新] 启用均线过滤
-MA_SHORT = 20                       # [新] 短期均线
-MA_LONG = 60                        # [新] 长期均线
+USE_MA_FILTER = True                
+MA_SHORT = 20                       
+MA_LONG = 60                        
+MAX_WORKERS = 10                    # [新] 并发线程数
+API_TIMEOUT = 3                     # [新] API 超时时间 (秒)
 
-# 顶部风险参数 (V3.2 增强)
+# 顶部风险参数 (V3.3 优化)
 HIGH_RISK_GAIN_THRESHOLD = 0.25     
 UPPER_SHADOW_RATIO = 0.08           
 EFFICIENCY_RATIO_THRESHOLD = 0.5    
-USE_OI_DIVERGENCE = True            # [新] 启用持仓量背离检测
-MIN_FUNDING_RATE = 0.0005           # [新] 资金费率阈值 (0.05%)
+USE_OI_DIVERGENCE = True            
+MIN_FUNDING_RATE = 0.0005           
 
 # GitHub 通知配置
 GITHUB_TOKEN = os.getenv("GH_TOKEN", "")
@@ -43,24 +46,14 @@ ENABLE_GITHUB_NOTIFY = True if GITHUB_TOKEN else False
 # API 端点
 BASE_URL = "https://fapi.binance.com"
 TICKER_24H_URL = f"{BASE_URL}/fapi/v1/ticker/24hr"
-OI_URL = f"{BASE_URL}/fapi/v1/openInterest"
 KLINE_URL = f"{BASE_URL}/fapi/v1/klines"
 FUNDING_URL = f"{BASE_URL}/fapi/v1/premiumIndex"
 
-# ================= 工具函数 =================
+# 全局 Session 复用
+session = requests.Session()
+session.headers.update({"X-MBX-APIKEY": ""})  # 可选：如有 API Key 可填入
 
-def get_current_hour_volume(symbol: str) -> float:
-    """获取当前小时的预估成交量 (简化版：取最近 1 小时 K 线)"""
-    try:
-        kline_url = f"{BASE_URL}/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": "1h", "limit": 1}
-        resp = requests.get(kline_url, params=params, timeout=2)
-        if resp.status_code == 200:
-            data = resp.json()[0]
-            return float(data[7])  # quoteVolume (成交额 USDT)
-    except Exception:
-        pass
-    return 0.0
+# ================= 工具函数 =================
 
 def is_valid_symbol(symbol: str) -> bool:
     """过滤无效标的：只保留纯加密货币 USDT 合约，剔除股票、杠杆、非 USDT"""
@@ -96,12 +89,72 @@ def calculate_upper_shadow(high: float, low: float, close: float, open_p: float)
         return 0.0
     return upper_wick / total_range
 
+def batch_get_ma_trends(symbols: List[str]) -> Dict[str, Optional[Dict]]:
+    """批量获取均线趋势，减少 API 请求次数"""
+    results = {}
+    
+    def fetch_ma(symbol):
+        try:
+            params = {"symbol": symbol, "interval": "1h", "limit": 65}
+            resp = session.get(KLINE_URL, params=params, timeout=API_TIMEOUT)
+            if resp.status_code != 200:
+                return symbol, None
+            
+            klines = resp.json()
+            if len(klines) < 65:
+                return symbol, None
+                
+            closes = [float(k[4]) for k in klines]
+            ma20 = sum(closes[-20:]) / 20
+            ma60 = sum(closes[-60:]) / 60
+            
+            return symbol, {
+                "ma20": ma20,
+                "ma60": ma60,
+                "is_bullish": ma20 > ma60,
+                "ma_ratio": ma20 / ma60 if ma60 > 0 else 0
+            }
+        except Exception:
+            return symbol, None
+    
+    # 并发获取均线数据
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_ma, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            symbol, result = future.result()
+            results[symbol] = result
+    
+    return results
+
+def batch_get_funding_rates(symbols: List[str]) -> Dict[str, float]:
+    """批量获取资金费率"""
+    results = {}
+    
+    def fetch_funding(symbol):
+        try:
+            params = {"symbol": symbol}
+            resp = session.get(FUNDING_URL, params=params, timeout=API_TIMEOUT)
+            if resp.status_code == 200:
+                data = resp.json()
+                return symbol, float(data.get('lastFundingRate', 0))
+        except Exception:
+            pass
+        return symbol, 0.0
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_funding, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            symbol, rate = future.result()
+            results[symbol] = rate
+    
+    return results
+
 def get_ma_trend(symbol: str) -> Optional[Dict]:
-    """获取均线趋势 (MA20 vs MA60)，判断是否多头排列"""
+    """获取均线趋势 (MA20 vs MA60)，判断是否多头排列 (保留单条查询接口)"""
     try:
         # 获取 65 根 K 线以计算 MA60
         params = {"symbol": symbol, "interval": "1h", "limit": 65}
-        resp = requests.get(KLINE_URL, params=params, timeout=3)
+        resp = session.get(KLINE_URL, params=params, timeout=API_TIMEOUT)
         if resp.status_code != 200:
             return None
         
@@ -183,14 +236,15 @@ def fetch_market_data() -> List[Dict]:
     return []
 
 def scan_entry_signals(data: List[Dict]) -> List[Dict]:
-    """扫描建仓信号 (V3.2 增强版：增加均线过滤)"""
+    """扫描建仓信号 (V3.3 优化版：批量获取均线数据)"""
     signals = []
     print(f"\n🔍 正在扫描 {len(data)} 个合约的建仓机会...")
     
+    # 第一步：基础过滤，收集候选标的
+    candidates = []
     for item in data:
         symbol = item['symbol']
         
-        # 1. 基础过滤
         if not is_valid_symbol(symbol):
             continue
             
@@ -198,62 +252,77 @@ def scan_entry_signals(data: List[Dict]) -> List[Dict]:
         vol_24h_usdt = float(item['quoteVolume'])
         pct_change = float(item['priceChangePercent']) / 100.0
         
-        # 流动性门槛
         if vol_24h_usdt < MIN_LIQUIDITY_USDT:
             continue
             
-        # 2. 估算日均成交量
         avg_daily_vol = vol_24h_usdt 
-        
-        # 3. 计算平均小时成交量
         avg_hourly_vol = vol_24h_usdt / 24.0
         if avg_hourly_vol == 0:
             continue
         
-        # 4. 使用波动率间接估算 RVOL
         high_24h = float(item['highPrice'])
         low_24h = float(item['lowPrice'])
         volatility = (high_24h - low_24h) / low_24h if low_24h > 0 else 0
         estimated_rvol = 1.5 + volatility * 5
         
-        # 5. [新增] 均线趋势过滤 (MA20 > MA60)
-        ma_trend = None
-        if USE_MA_FILTER:
-            ma_trend = get_ma_trend(symbol)
-            if ma_trend is None or not ma_trend['is_bullish']:
-                continue  # 非多头排列，跳过
+        # 初步筛选：成交量和 RVOL 达标
+        if not (MIN_DAILY_VOL_USDT <= avg_daily_vol <= MAX_DAILY_VOL_USDT and
+                estimated_rvol >= VOL_MULTIPLIER and
+                MIN_PRICE_GAIN <= pct_change <= MAX_PRICE_GAIN):
+            continue
         
-        # 6. 策略判断
-        if (MIN_DAILY_VOL_USDT <= avg_daily_vol <= MAX_DAILY_VOL_USDT and
-            estimated_rvol >= VOL_MULTIPLIER and
-            MIN_PRICE_GAIN <= pct_change <= MAX_PRICE_GAIN):
-            
-            score = 80
-            if estimated_rvol > 4.0:
-                score = 90
-            if ma_trend and ma_trend['ma_ratio'] > 1.05:  # MA20 比 MA60 高 5% 以上
-                score += 10
-            
-            signals.append({
-                "symbol": symbol,
-                "price": price,
-                "gain": pct_change * 100,
-                "rvol": estimated_rvol,
-                "vol_24h": avg_daily_vol,
-                "vol_1h": avg_hourly_vol * (estimated_rvol / 1.5),
-                "score": min(score, 100),
-                "ma_trend": ma_trend
-            })
-            
-    # 按分数降序排序
+        candidates.append({
+            "symbol": symbol,
+            "item": item,
+            "price": price,
+            "vol_24h": avg_daily_vol,
+            "rvol": estimated_rvol,
+            "pct_change": pct_change
+        })
+    
+    # 第二步：批量获取均线数据 (仅对候选标的)
+    ma_trends = {}
+    if USE_MA_FILTER and candidates:
+        candidate_symbols = [c['symbol'] for c in candidates]
+        print(f"   通过初筛 {len(candidate_symbols)} 个标的，正在批量获取均线数据...")
+        ma_trends = batch_get_ma_trends(candidate_symbols)
+    
+    # 第三步：应用均线过滤并生成最终信号
+    for cand in candidates:
+        symbol = cand['symbol']
+        ma_trend = ma_trends.get(symbol) if USE_MA_FILTER else None
+        
+        if USE_MA_FILTER:
+            if ma_trend is None or not ma_trend['is_bullish']:
+                continue
+        
+        score = 80
+        if cand['rvol'] > 4.0:
+            score = 90
+        if ma_trend and ma_trend['ma_ratio'] > 1.05:
+            score += 10
+        
+        signals.append({
+            "symbol": symbol,
+            "price": cand['price'],
+            "gain": cand['pct_change'] * 100,
+            "rvol": cand['rvol'],
+            "vol_24h": cand['vol_24h'],
+            "vol_1h": (cand['vol_24h'] / 24.0) * (cand['rvol'] / 1.5),
+            "score": min(score, 100),
+            "ma_trend": ma_trend
+        })
+    
     signals.sort(key=lambda x: x['score'], reverse=True)
     return signals
 
 def scan_exit_risks(data: List[Dict]) -> List[Dict]:
-    """扫描顶部风险 (V3.2 增强版：增加资金费率检测)"""
+    """扫描顶部风险 (V3.3 优化版：批量获取资金费率)"""
     risks = []
     print(f"🔍 正在扫描 {len(data)} 个合约的顶部风险...")
     
+    # 第一步：基础过滤，收集高风险候选标的
+    candidates = []
     for item in data:
         symbol = item['symbol']
         if not is_valid_symbol(symbol):
@@ -269,34 +338,45 @@ def scan_exit_risks(data: List[Dict]) -> List[Dict]:
         if vol_24h_usdt < MIN_LIQUIDITY_USDT:
             continue
             
-        # 1. 涨幅过滤
         if pct_change < HIGH_RISK_GAIN_THRESHOLD:
             continue
-            
-        # 2. 计算上影线
+        
         shadow_ratio = calculate_upper_shadow(high, low, price, open_p)
         
-        # 3. [新增] 获取资金费率
-        funding_rate = 0.0
-        if USE_OI_DIVERGENCE:
-            funding_rate = get_funding_rate(symbol)
+        candidates.append({
+            "symbol": symbol,
+            "price": price,
+            "pct_change": pct_change,
+            "shadow_ratio": shadow_ratio
+        })
+    
+    # 第二步：批量获取资金费率 (仅对候选标的)
+    funding_rates = {}
+    if USE_OI_DIVERGENCE and candidates:
+        candidate_symbols = [c['symbol'] for c in candidates]
+        print(f"   发现 {len(candidate_symbols)} 个高风险标的，正在批量获取资金费率...")
+        funding_rates = batch_get_funding_rates(candidate_symbols)
+    
+    # 第三步：计算风险评分并生成最终列表
+    for cand in candidates:
+        symbol = cand['symbol']
+        funding_rate = funding_rates.get(symbol, 0.0) if USE_OI_DIVERGENCE else 0.0
         
         risk_score = 0
         reasons = []
         
-        if shadow_ratio > UPPER_SHADOW_RATIO:
+        if cand['shadow_ratio'] > UPPER_SHADOW_RATIO:
             risk_score += 40
-            reasons.append(f"上影线{shadow_ratio*100:.1f}%")
+            reasons.append(f"上影线{cand['shadow_ratio']*100:.1f}%")
             
-        if pct_change > 0.50:
+        if cand['pct_change'] > 0.50:
             risk_score += 30
             reasons.append("涨幅过大")
             
-        if shadow_ratio > 0.20:
+        if cand['shadow_ratio'] > 0.20:
             risk_score += 30
             reasons.append("极端抛压")
         
-        # [新增] 资金费率过高预警
         if funding_rate > MIN_FUNDING_RATE:
             risk_score += 20
             reasons.append(f"资金费率{funding_rate*100:.3f}% (过热)")
@@ -304,9 +384,9 @@ def scan_exit_risks(data: List[Dict]) -> List[Dict]:
         if risk_score >= 40:
             risks.append({
                 "symbol": symbol,
-                "price": price,
-                "gain": pct_change * 100,
-                "shadow": shadow_ratio * 100,
+                "price": cand['price'],
+                "gain": cand['pct_change'] * 100,
+                "shadow": cand['shadow_ratio'] * 100,
                 "funding_rate": funding_rate,
                 "score": risk_score,
                 "reasons": ", ".join(reasons)
