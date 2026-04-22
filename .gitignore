@@ -4,7 +4,4 @@
 
 # Environment
 .env.local
-
-# VS Code
-.vscode/
 ```
