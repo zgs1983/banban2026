@@ -1,1 +1,10 @@
-Nothing should be ignored based on the provided file changes. The only modified file is `binance_screener.py`, which is a Python source code file and should not be ignored. No build artifacts, dependencies, or temporary files are present in the changes.
+```
+# Logs
+*.log
+
+# Environment
+.env.local
+
+# VS Code
+.vscode/
+```
